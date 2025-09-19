@@ -13,6 +13,7 @@ Water-Segmentation-Project/
 │── app.py                      # Streamlit app for deployment
 │── final_model.pth             # Trained model weights
 │── normalize_stats.json        # Global mean/std for dataset-wide normalization
+│── requirements.txt
 │── README.md                   # Project documentation
 ```
 
