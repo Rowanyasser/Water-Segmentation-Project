@@ -103,9 +103,7 @@ streamlit run app.py
 ---
 
 ## 📌 Future Work
-- Support more satellite datasets (Sentinel-2, Landsat, etc.).
-- Optimize inference for large images.
-- Extend to multi-class segmentation (e.g., water, vegetation, urban).
+- Update model to a pretrained one
 
 ---
 
