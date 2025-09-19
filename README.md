@@ -21,7 +21,6 @@ Water-Segmentation-Project/
 ## 🧠 Model Overview
 The model is a **TransUNet**:
 - **Encoder (CNN blocks)**: Extract low-level features.
-- **Transformer bottleneck**: Captures global context & long-range dependencies.
 - **Decoder (Upsampling + skip connections)**: Reconstructs segmentation mask.
 - **Output**: Binary mask (water vs non-water).
 
