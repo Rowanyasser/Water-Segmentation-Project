@@ -1,215 +1,314 @@
-import streamlit as st
+from flask import Flask, request, render_template
 import torch
+import torch.nn as nn
 import numpy as np
-import cv2
-from pathlib import Path
-from PIL import Image
 import io
 import base64
-import tifffile
-from scipy import ndimage
-from model import TransUNet
 import json
+import matplotlib.pyplot as plt
+from PIL import Image
+import logging
+import segmentation_models_pytorch as smp
+import os
+import torch.nn.functional as F
+from utils import read_multiband_tif, read_mask, safe_div, compute_ndwi, compute_mndwi, compute_awei, compute_ndvi, sobel, ndimage
+from sklearn.metrics import f1_score, jaccard_score
 
-# Config
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Device
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = Path("final_model.pth")
-NORMALIZE_STATS_PATH = Path("normalize_stats.json")
-NUM_CHANNELS = 22
-IMG_SIZE = 256
-MIN_BANDS = 7  # Minimum channels for feature engineering
-WATER_THRESHOLD = 0.05  # Water presence if >5% of pixels are water
 
-# Feature engineering helpers
-def safe_div(a, b, eps=1e-6):
-    return a / (b + eps)
-
-def compute_ndwi(green, nir):
-    return safe_div(green - nir, green + nir)
-
-def compute_mndwi(green, swir):
-    return safe_div(green - swir, green + swir)
-
-def compute_awei(blue, green, nir, swir1, swir2):
-    return 4 * (green - swir1) - (0.25 * nir + 2.75 * swir2)
-
-def compute_ndvi(red, nir):
-    return safe_div(nir - red, nir + red)
-
-# Load model
-@st.cache_resource
-def load_model():
-    try:
-        model = TransUNet(in_ch=NUM_CHANNELS, n_classes=1).to(DEVICE)
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
-        model.eval()
-        st.success("Model loaded successfully")
-        return model
-    except Exception as e:
-        st.error(f"Failed to load model: {e}")
-        return None
-
-model = load_model()
-if model is None:
-    st.stop()
-
-# Load normalize_stats
+# Dynamically select the best model based on IoU
 try:
-    normalize_stats = json.load(open(NORMALIZE_STATS_PATH))
-    normalize_stats = {'mean': np.array(normalize_stats['mean'], dtype=np.float32),
-                       'std': np.array(normalize_stats['std'], dtype=np.float32)}
-    st.success("Loaded normalize_stats successfully")
-except Exception as e:
-    st.error(f"Failed to load normalize_stats: {e}. Please run notebook cell to save normalize_stats.json.")
-    st.stop()
+    with open('pretrained_model_stats.json', 'r') as f_pre:
+        pretrained_stats = json.load(f_pre)
+    with open('baseline_model_stats.json', 'r') as f_base:
+        baseline_stats = json.load(f_base)
+    pretrained_iou = pretrained_stats['metrics']['IoU']
+    baseline_iou = baseline_stats['metrics']['IoU']
+    USE_PRETRAINED = pretrained_iou > baseline_iou
+    BEST_MODEL_PATH = "best_pretrained_Raw.pth" if USE_PRETRAINED else "best_baseline_model.pth"
+    IN_CHANNELS = 3 if USE_PRETRAINED else 19  # Adjusted to 19 for baseline to match checkpoint
+    IS_PRETRAINED = USE_PRETRAINED
+    STATS_FILE = "pretrained_model_stats.json" if USE_PRETRAINED else "baseline_model_stats.json"
+    logging.info(f"Selected model: {'Pretrained' if USE_PRETRAINED else 'Baseline (from scratch)'} with IoU {max(pretrained_iou, baseline_iou):.4f}")
+except FileNotFoundError as e:
+    logging.error(f"Model stats file not found: {e}")
+    raise
 
-# Preprocessing
-def preprocess_image(uploaded_file):
+# Load stats for the selected model
+try:
+    with open(STATS_FILE, 'r') as f:
+        stats = json.load(f)
+    mean = np.array(stats['normalize_stats']['mean'])
+    std = np.array(stats['normalize_stats']['std'])
+    feature_indices = stats.get('feature_indices', {})  # For baseline
+    selected_bands = stats.get('selected_bands', None)  # For pretrained
+except FileNotFoundError as e:
+    logging.error(f"Stats file not found: {e}")
+    raise
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout=0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(dropout),
+        )
+    def forward(self, x): return self.net(x)
+
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch, dropout=0.1):
+        super().__init__()
+        self.mpconv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(in_ch, out_ch, dropout=dropout)
+        )
+    def forward(self, x): return self.mpconv(x)
+
+class Up(nn.Module):
+    def __init__(self, in_ch, out_ch, bilinear=True, dropout=0.3):
+        super().__init__()
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConv(in_ch, out_ch, dropout=dropout)
+        else:
+            self.up = nn.ConvTranspose2d(in_ch // 2, in_ch // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConv(in_ch, out_ch, dropout=dropout)
+
+    def forward(self, x1, x2):
+        x1 = self.up(x1)
+        diffY = x2.size()[2] - x1.size()[2]
+        diffX = x2.size()[3] - x1.size()[3]
+        x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2, diffY // 2, diffY - diffY // 2])
+        x = torch.cat([x2, x1], dim=1)
+        return self.conv(x)
+
+class TransUNet(nn.Module):
+    def __init__(self, in_ch=19, n_classes=1, base_c=32, bilinear=True, dropout=0.3):
+        super().__init__()
+        self.inc = DoubleConv(in_ch, base_c, dropout=dropout)
+        self.down1 = Down(base_c, base_c*2, dropout=dropout)
+        self.down2 = Down(base_c*2, base_c*4, dropout=dropout)
+        self.down3 = Down(base_c*4, base_c*8, dropout=dropout)
+        factor = 2 if bilinear else 1
+        self.down4 = Down(base_c*8, base_c*16 // factor, dropout=dropout)
+        self.up1 = Up(base_c*16, base_c*8 // factor, bilinear, dropout=dropout)
+        self.up2 = Up(base_c*8, base_c*4 // factor, bilinear, dropout=dropout)
+        self.up3 = Up(base_c*4, base_c*2 // factor, bilinear, dropout=dropout)
+        self.up4 = Up(base_c*2, base_c, bilinear, dropout=dropout)
+        self.outc = nn.Conv2d(base_c, n_classes, 1)
+
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x = self.up1(x5, x4)
+        x = self.up2(x, x3)
+        x = self.up3(x, x2)
+        x = self.up4(x, x1)
+        return self.outc(x)
+
+# Load model with error handling
+if IS_PRETRAINED:
+    model = smp.UNet(encoder_name="resnet34", in_channels=IN_CHANNELS, classes=1)  # Use UNet to match checkpoint structure
+else:
+    model = TransUNet(in_ch=IN_CHANNELS, n_classes=1)  # Use baseline TransUNet
+try:
+    model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
+except RuntimeError as e:
+    logging.error(f"Failed to load state dict: {e}. Ensure the model architecture matches the checkpoint.")
+    raise
+model.eval()
+model = model.to(DEVICE)
+logging.info(f"Loaded model from {BEST_MODEL_PATH} with {IN_CHANNELS} input channels")
+
+app = Flask(__name__, template_folder='templates', static_folder='static')
+
+def predict_image(image_file, mask_file=None):
+    """
+    Returns:
+        viz_data (base64 png),
+        prob_map (uint8 0-255),
+        overall_conf (float 0..1),
+        pred_conf (float 0..1),
+        metrics (dict or None) -> {"IoU":..., "F1":...}
+    """
+    # Define temp_path for the image file
+    temp_path = f"/tmp/{image_file.filename}"
     try:
-        img_bytes = uploaded_file.read()
-        img = tifffile.imread(io.BytesIO(img_bytes))
-        if img.ndim == 3 and img.shape[0] > img.shape[2]:
-            img = img.transpose(2, 0, 1)
-        elif img.ndim == 2:
-            img = img[None, ...]
-    except Exception as e:
-        st.error(f"Failed to load TIFF: {e}. This app requires a multispectral .tif file.")
-        return None, None, None
-    img = img.astype(np.float32)
+        # Save uploaded image file
+        image_file.save(temp_path)
+        # Read the multi-band image
+        img = read_multiband_tif(temp_path)
+        if img is None or img.size == 0:
+            raise ValueError("Failed to read the image file or image is empty.")
+        C, H, W = img.shape
 
-    C, H, W = img.shape
-    st.write(f"Input image shape: {C, H, W}")
+        # Feature engineering (only if selected_bands is None, i.e., Raw dataset)
+        extra_chs = []
+        fi = feature_indices if not IS_PRETRAINED else {i: i for i in range(C)}
+        if selected_bands and IS_PRETRAINED:
+            img = img[selected_bands]
+        if 'green' in fi and 'nir' in fi:
+            extra_chs.append(compute_ndwi(img[fi['green']], img[fi['nir']])[None, ...])
+        if 'green' in fi and 'swir1' in fi:
+            extra_chs.append(compute_mndwi(img[fi['green']], img[fi['swir1']])[None, ...])
+        if all(k in fi for k in ('coastal', 'green', 'nir', 'swir1', 'swir2')):
+            extra_chs.append(compute_awei(img[fi['coastal']], img[fi['green']], img[fi['nir']], img[fi['swir1']], img[fi['swir2']])[None, ...])
+        if 'red' in fi and 'nir' in fi:
+            extra_chs.append(compute_ndvi(img[fi['red']], img[fi['nir']])[None, ...])
+        if 'green' in fi:
+            edges = np.sqrt(sobel(img[fi['green']], axis=0)**2 + sobel(img[fi['green']], axis=1)**2)
+            extra_chs.append(edges[None, ...])
+        if 'blue' in fi and 'red' in fi:
+            extra_chs.append(safe_div(img[fi['blue']], img[fi['red']])[None, ...])
+        if 'green' in fi:
+            local_mean = ndimage.uniform_filter(img[fi['green']], size=5)
+            local_sqr_mean = ndimage.uniform_filter(img[fi['green']]**2, size=5)
+            local_var = local_sqr_mean - local_mean**2
+            extra_chs.append(local_var[None, ...])
 
-    # Check for sufficient channels
-    if C < MIN_BANDS:
-        st.error(f"Image has {C} channels, but at least {MIN_BANDS} are required for feature engineering (e.g., blue, green, red, nir, swir1, swir2).")
-        return None, None, None
+        if extra_chs:
+            img = np.concatenate([img] + extra_chs, axis=0)
 
-    # Feature engineering
-    fi = {'blue': 0, 'green': 1, 'red': 2, 'nir': 4, 'swir1': 5, 'swir2': 6}
-    extra_chs = []
-    try:
-        extra_chs.append(compute_ndwi(img[fi['green']], img[fi['nir']])[None, ...].astype(np.float32))
-        extra_chs.append(compute_mndwi(img[fi['green']], img[fi['swir1']])[None, ...].astype(np.float32))
-        extra_chs.append(compute_awei(img[fi['blue']], img[fi['green']], img[fi['nir']],
-                                     img[fi['swir1']], img[fi['swir2']])[None, ...].astype(np.float32))
-        extra_chs.append(compute_ndvi(img[fi['red']], img[fi['nir']])[None, ...].astype(np.float32))
-        sobel_edges = np.stack([ndimage.sobel(img[i], mode='constant') for i in range(C)], axis=0).astype(np.float32)
-        extra_chs.append(sobel_edges.mean(axis=0)[None, ...])
-    except Exception as e:
-        st.error(f"Feature engineering failed: {e}")
-        return None, None, None
+        # Normalize
+        if mean.shape[0] != img.shape[0]:
+            extra = img.shape[0] - mean.shape[0]
+            mean_ext = np.concatenate([mean, np.zeros(extra)])
+            std_ext = np.concatenate([std, np.ones(extra)])
+        else:
+            mean_ext, std_ext = mean, std
+        img_norm = (img - mean_ext[:, None, None]) / (std_ext[:, None, None] + 1e-6)
 
-    if extra_chs:
-        img = np.concatenate([img] + extra_chs, axis=0)
-
-    if img.shape[0] < NUM_CHANNELS:
-        img = np.pad(img, ((0, NUM_CHANNELS - img.shape[0]), (0, 0), (0, 0)), mode='constant').astype(np.float32)
-    assert img.shape[0] == NUM_CHANNELS, f"Channels mismatch: {img.shape[0]} != {NUM_CHANNELS}"
-
-    img_resized = np.zeros((NUM_CHANNELS, IMG_SIZE, IMG_SIZE), dtype=np.float32)
-    for ch in range(NUM_CHANNELS):
-        img_resized[ch] = cv2.resize(img[ch], (IMG_SIZE, IMG_SIZE))
-
-    mean = normalize_stats['mean'][:, None, None]
-    std = normalize_stats['std'][:, None, None]
-    if mean.shape[0] < img_resized.shape[0]:
-        extra = img_resized.shape[0] - mean.shape[0]
-        mean = np.concatenate([mean, np.zeros((extra, 1, 1), dtype=np.float32)], axis=0)
-        std = np.concatenate([std, np.ones((extra, 1, 1), dtype=np.float32)], axis=0)
-    img_norm = (img_resized - mean) / (std + 1e-6)
-
-    tensor = torch.from_numpy(img_norm).unsqueeze(0).to(DEVICE).float()
-
-    # Create RGB for display
-    try:
-        img_rgb = img[[2, 1, 0], :, :].transpose(1, 2, 0)  # RGB bands
-        img_rgb = cv2.resize(img_rgb, (IMG_SIZE, IMG_SIZE))  # Resize to 256x256
-        img_rgb = (img_rgb - img_rgb.min()) / (img_rgb.max() - img_rgb.min() + 1e-6) * 255
-        img_rgb = img_rgb.astype(np.uint8)
-        st.write(f"RGB image shape: {img_rgb.shape}")
-    except Exception as e:
-        st.error(f"Failed to create RGB image for display: {e}")
-        img_rgb = None
-
-    return tensor, img_resized.transpose(1, 2, 0), img_rgb
-
-# Prediction
-def predict_mask(image_tensor, threshold=0.5):
-    try:
+        # Predict
+        img_tensor = torch.from_numpy(img_norm).float().unsqueeze(0).to(DEVICE)
         with torch.no_grad():
-            logits = model(image_tensor)
-            probs = torch.sigmoid(logits)
-            mask = (probs > threshold).float().cpu().numpy()[0, 0]
-        st.write(f"Mask shape: {mask.shape}")
-        return mask
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-        return None
+            output = torch.sigmoid(model(img_tensor)).squeeze().cpu().numpy()
+        if output.ndim == 3 and output.shape[0] == 1:
+            output = output[0]
 
-# Overlay mask
-def overlay_mask(img_rgb, mask, alpha=0.5):
-    try:
-        mask_resized = cv2.resize(mask, (img_rgb.shape[1], img_rgb.shape[0]))  # Ensure mask matches img_rgb
-        mask_colored = np.zeros_like(img_rgb)  # Shape (256, 256, 3)
-        mask_colored[mask_resized > 0] = [255, 0, 0]
-        overlaid = cv2.addWeighted(img_rgb, 1 - alpha, mask_colored, alpha, 0)
-        return overlaid
-    except Exception as e:
-        st.error(f"Overlay failed: {e}")
-        return None
+        # Binary mask and probability map
+        pred_mask_binary = (output > 0.5).astype(np.uint8)
+        pred_mask = pred_mask_binary * 255
+        prob_map = (output * 255).astype(np.uint8)
 
-# Streamlit UI
-st.title("Advanced Water Body Segmentation App")
-st.write("Upload a multispectral satellite image (.tif, with at least 7 bands: blue, green, red, nir, swir1, swir2, etc.) to segment water bodies.")
+        # Confidence metrics
+        overall_conf = float(output.mean())
+        pred_conf = float(output[pred_mask_binary == 1].mean()) if pred_mask_binary.sum() > 0 else 0.0
 
-uploaded_file = st.file_uploader("Upload an image (.tif)", type=["tif"])
+        # RGB composite for visualization
+        if img_norm.shape[0] >= 3:
+            rgb_unnorm = (img_norm[:3] * std_ext[:3, None, None]) + mean_ext[:3, None, None]
+            rgb_img_arr = np.clip(rgb_unnorm.transpose(1, 2, 0), 0, 1) * 255.0
+            rgb_img = Image.fromarray(rgb_img_arr.astype(np.uint8))
+        else:
+            single = img_norm[0]
+            rgb_img_arr = np.clip((single - single.min()) / (single.max() - single.min() + 1e-6), 0, 1)
+            rgb_img_arr = np.stack([rgb_img_arr]*3, axis=-1) * 255.0
+            rgb_img = Image.fromarray(rgb_img_arr.astype(np.uint8))
 
-if uploaded_file is not None:
-    tensor, img_resized, img_rgb = preprocess_image(uploaded_file)
-    if tensor is None or img_resized is None or img_rgb is None:
-        st.error("Preprocessing failed. Check logs above.")
-        st.stop()
+        # Ground truth metrics if mask_file is provided
+        metrics = None
+        gt_mask = None
+        if mask_file and mask_file.filename:
+            mask_temp_path = f"/tmp/{mask_file.filename}"
+            try:
+                mask_file.save(mask_temp_path)
+                gt_mask = read_mask(mask_temp_path)
+                if gt_mask.shape != pred_mask_binary.shape:
+                    gt_pil = Image.fromarray((gt_mask * 255).astype(np.uint8)).convert("L")
+                    gt_pil = gt_pil.resize((pred_mask_binary.shape[1], pred_mask_binary.shape[0]), resample=Image.NEAREST)
+                    gt_mask = (np.array(gt_pil) > 127).astype(np.uint8)
 
-    st.image(img_rgb, caption="Uploaded Image (RGB)", use_column_width=True)
+                try:
+                    iou = jaccard_score(gt_mask.flatten(), pred_mask_binary.flatten(), zero_division=0)
+                    f1 = f1_score(gt_mask.flatten(), pred_mask_binary.flatten(), zero_division=0)
+                    metrics = {"IoU": float(iou), "F1": float(f1)}
+                except Exception as e:
+                    logging.warning(f"Metrics computation failed: {e}")
+                    metrics = {"IoU": 0.0, "F1": 0.0}
+            except Exception as e:
+                logging.error(f"Failed to process mask file: {e}")
+                metrics = None
+            finally:
+                if os.path.exists(mask_temp_path):
+                    try:
+                        os.remove(mask_temp_path)
+                    except Exception as e:
+                        logging.warning(f"Failed to remove temporary mask file: {e}")
 
-    threshold = st.slider("Confidence Threshold", min_value=0.1, max_value=0.9, value=0.5, step=0.05)
-    alpha = st.slider("Mask Transparency (for overlay)", min_value=0.0, max_value=1.0, value=0.5, step=0.1)
+        # Visualization
+        fig, axs = plt.subplots(1, 3 if gt_mask is not None else 2, figsize=(12, 4))
+        axs[0].imshow(rgb_img)
+        axs[0].set_title('Original Image')
+        axs[0].axis('off')
+        axs[1].imshow(pred_mask, cmap='gray')
+        axs[1].set_title('Predicted Mask')
+        axs[1].axis('off')
+        if gt_mask is not None:
+            axs[2].imshow(gt_mask * 255, cmap='gray')
+            axs[2].set_title('Ground Truth')
+            axs[2].axis('off')
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight')
+        buf.seek(0)
+        viz_data = base64.b64encode(buf.read()).decode('utf-8')
+        plt.close(fig)
 
-    mask = predict_mask(tensor, threshold)
-    if mask is None:
-        st.stop()
+        return viz_data, prob_map, overall_conf, pred_conf, metrics
 
-    # Water presence check
-    water_ratio = np.mean(mask > 0)
-    if water_ratio > WATER_THRESHOLD:
-        st.success(f"Water Present: Yes (Area: {water_ratio * 100:.2f}%)")
-    else:
-        st.warning(f"Water Present: No (Area: {water_ratio * 100:.2f}%)")
+    finally:
+        # Clean up temporary image file
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception as e:
+                logging.warning(f"Failed to remove temporary image file: {e}")
 
-    overlaid = overlay_mask(img_rgb, mask, alpha)
-    if overlaid is None:
-        st.stop()
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    viz_data = None
+    error = None
+    overall_conf, pred_conf, metrics = None, None, None
 
-    st.subheader("Prediction Results")
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.image(img_rgb, caption="Original Image (RGB)", use_column_width=True)
-    with col2:
-        st.image((mask * 255).astype(np.uint8), caption="Predicted Water Mask", use_column_width=True)
-    with col3:
-        st.image(overlaid, caption="Overlaid Mask", use_column_width=True)
+    if request.method == 'POST':
+        image_file = request.files.get('image')
+        mask_file = request.files.get('mask')
+        if image_file and image_file.filename:
+            try:
+                viz_data, _, overall_conf, pred_conf, metrics = predict_image(image_file, mask_file)
+            except Exception as e:
+                logging.error(f"Prediction error: {e}")
+                error = f"Error: {str(e)}"
+        else:
+            error = "No valid image file provided."
 
-    st.subheader("Downloads")
-    def get_download_link(img, filename, text):
-        try:
-            buffered = io.BytesIO()
-            Image.fromarray(img).save(buffered, format="PNG")
-            b64 = base64.b64encode(buffered.getvalue()).decode()
-            return f'<a href="data:image/png;base64,{b64}" download="{filename}">{text}</a>'
-        except Exception as e:
-            st.error(f"Download link creation failed: {e}")
-            return ""
+    best_iou = max(pretrained_iou, baseline_iou)
 
-    st.markdown(get_download_link((mask * 255).astype(np.uint8), "water_mask.png", "Download Mask"), unsafe_allow_html=True)
-    st.markdown(get_download_link(overlaid, "overlaid_image.png", "Download Overlaid Image"), unsafe_allow_html=True)
+    return render_template(
+        'index.html',
+        viz_data=viz_data,
+        error=error,
+        pretrained_iou=pretrained_iou,
+        baseline_iou=baseline_iou,
+        best_iou=best_iou,
+        use_pretrained=USE_PRETRAINED,
+        overall_conf=overall_conf,
+        pred_conf=pred_conf,
+        metrics=metrics
+    )
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
