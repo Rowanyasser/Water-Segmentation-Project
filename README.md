@@ -1,10 +1,16 @@
-Water-Segmentation-Project
-This project detects and segments water bodies from multispectral satellite images using deep learning models.It includes two training notebooks (pretrained and baseline/from-scratch) and a Flask web app for deployment. The app dynamically selects the best model (pretrained or baseline) based on validation IoU.
+# Water-Segmentation-Project
 
-📂 Repository Structure
+This project detects and segments **water bodies** from multispectral satellite images using **deep learning models**.  
+It includes two **training notebooks** (pretrained and baseline/from-scratch) and a **Flask web app** for deployment.  
+The app dynamically selects the best model (pretrained or baseline) based on **validation IoU**.
+
+---
+
+## 📂 Repository Structure
+```
 Water-Segmentation-Project/
-│── WaterSegmentation.ipynb                # Jupyter Notebook: Pretrained model training & evaluation
-│── WaterSegmentation_baselineModel.ipynb  # Jupyter Notebook: Baseline (from-scratch) model training & evaluation
+│── WaterSegmentation.ipynb                # Pretrained model training & evaluation
+│── WaterSegmentation_baselineModel.ipynb  # Baseline (from-scratch) model training & evaluation
 │── app.py                                 # Flask web app for deployment
 │── utils.py                               # Utility functions (image reading, feature engineering, etc.)
 │── templates/
@@ -12,128 +18,147 @@ Water-Segmentation-Project/
 │── static/
 │   └── css/
 │       └── styles.css                     # CSS styles for the Flask app
-│── best_pretrained_Raw.pth                # Trained weights for the best pretrained model
-│── best_baseline_model.pth                # Trained weights for the baseline model
-│── pretrained_model_stats.json            # Stats (metrics, normalization) for pretrained model
-│── baseline_model_stats.json              # Stats (metrics, normalization) for baseline model
-│── normalize_stats.json                   # Global mean/std for dataset-wide normalization (from baseline)
-│── requirements.txt                       # Python dependencies
-│── README.md                              # Project documentation
+│── best_pretrained_Raw.pth                # Weights for pretrained UNet model
+│── best_baseline_model.pth                # Weights for baseline TransUNet model
+│── pretrained_model_stats.json            # Metrics + normalization stats (pretrained model)
+│── baseline_model_stats.json              # Metrics + normalization stats (baseline model)
+│── normalize_stats.json                   # Dataset-wide normalization stats
+│── requirements.txt
+│── README.md
+```
 
+---
 
-🧠 Model Overview
+## 🧠 Model Overview
 Two models are trained and evaluated:
 
-Pretrained Model: UNet with ResNet34 encoder (from segmentation_models_pytorch). Uses raw bands (12 channels) or chosen bands (10 channels with PCA). Fine-tuned on water segmentation.
-Baseline Model (From Scratch): Custom TransUNet (CNN encoder + upsampling decoder with skip connections). Uses 12 raw bands + 7 engineered features (total 19 channels).
+- **Pretrained Model (UNet + ResNet34 encoder)**  
+  - Uses raw 12 bands or PCA-reduced 10 bands  
+  - Fine-tuned with BCEWithLogits loss  
 
-The Flask app compares IoU from pretrained_model_stats.json and baseline_model_stats.json, then loads the better model dynamically.Loss: BCEWithLogits (with optional positive weighting for class imbalance).Metrics: IoU (Jaccard), F1, Precision, Recall.
+- **Baseline Model (TransUNet from scratch)**  
+  - Encoder–decoder with skip connections  
+  - Input: 12 raw bands + 7 engineered features → **19 channels**
 
-🛰️ Data Preprocessing
+The Flask app automatically compares **IoU** from both models and loads the one with better performance.
 
-Input: Multispectral .tif images (12+ bands: Coastal, Blue, Green, Red, NIR, SWIR1, SWIR2, etc.). Masks: Binary .png/.tif (water=1, non-water=0).
-Pretrained Model:
-Uses raw (12 bands) or chosen bands (10 with PCA for dimensionality reduction).
-Normalization: Per-channel mean/std from dataset stats.
+**Metrics:** IoU, F1, Precision, Recall
 
+---
 
-Baseline Model:
-Feature engineering adds extra channels:
-NDWI (Normalized Difference Water Index)
-MNDWI (Modified NDWI)
-AWEI (Automated Water Extraction Index)
-NDVI (Vegetation Index)
-Sobel edges (on Green band)
-Blue/Red ratio
-Local variance (on Green band)
+## 🛰️ Data Preprocessing
+- Input: **Multispectral `.tif` images** (12+ bands: Coastal, Blue, Green, Red, NIR, SWIR1, SWIR2, …)  
+- Masks: **Binary `.png/.tif`** (water=1, non-water=0)  
 
+### Pretrained Model
+- Uses 12 bands or 10 PCA-selected bands  
+- Normalization: per-channel mean & std  
 
-Final input: 19-channel tensor (bands + features).
-Normalization: Dataset-wide mean & std stored in normalize_stats.json.
+### Baseline Model
+Adds engineered features:
+- NDWI, MNDWI, AWEI  
+- NDVI  
+- Sobel edges (Green)  
+- Blue/Red ratio  
+- Local variance (Green)  
 
+➡️ Final input = **19-channel tensor**  
+➡️ Normalization: dataset-wide mean/std (`normalize_stats.json`)  
 
-Augmentations (in notebooks): Albumentations (flips, rotations, brightness/contrast).
+**Augmentations:** flips, rotations, brightness/contrast (Albumentations)
 
+---
 
-⚙️ Installation
-Clone the repo and install dependencies:
+## ⚙️ Installation
+```bash
 git clone https://github.com/<your-username>/Water-Segmentation-Project.git
 cd Water-Segmentation-Project
 pip install -r requirements.txt
+```
 
+---
 
-🚀 Training (Notebooks)
-Open the notebooks:
+## 🚀 Training (Notebooks)
+
+Open with Jupyter:
+```bash
 jupyter notebook
+```
 
-Pretrained Notebook (WaterSegmentation.ipynb):
+### Pretrained Notebook (`WaterSegmentation.ipynb`)
+1. Load images & masks  
+2. (Optional) PCA band selection  
+3. Normalize  
+4. Train/fine-tune **UNet (ResNet34)**  
+5. Save → `best_pretrained_Raw.pth` & `pretrained_model_stats.json`
 
-Load images & masks.
-Optional: Select bands + PCA.
-Normalize using computed stats.
-Train/fine-tune UNet (ResNet34 encoder).
-Evaluate (IoU, F1, etc.) & save model/stats → best_pretrained_Raw.pth & pretrained_model_stats.json.
+### Baseline Notebook (`WaterSegmentation_baselineModel.ipynb`)
+1. Load images & masks  
+2. Compute engineered features  
+3. Normalize → `normalize_stats.json`  
+4. Train **TransUNet from scratch**  
+5. Save → `best_baseline_model.pth` & `baseline_model_stats.json`
 
-Baseline Notebook (WaterSegmentation_baselineModel.ipynb):
+---
 
-Load images & masks.
-Compute features (NDWI, edges, etc.).
-Normalize → normalize_stats.json.
-Train TransUNet from scratch.
-Evaluate & save model/stats → best_baseline_model.pth & baseline_model_stats.json.
+## 🌐 Deployment (Flask App)
 
-
-🌐 Deployment (Flask App)
 Run the app:
+```bash
 python app.py
+```
 
-Access at http://127.0.0.1:5000 (or http://0.0.0.0:5000 for network access).
-App Features:
+Access:
+- Local → [http://127.0.0.1:5000](http://127.0.0.1:5000)  
+- Network → [http://0.0.0.0:5000](http://0.0.0.0:5000)  
 
-Dynamic Model Selection: Loads the model (pretrained or baseline) with the highest IoU.
-Upload a .tif multispectral image (required) and optional ground truth mask (.png/.tif).
-Automatic preprocessing + feature engineering (based on selected model).
-Predict water segmentation mask.
-Visualize (side-by-side):
-Original RGB composite.
-Predicted binary mask.
-Ground truth mask (if uploaded).
+### Features
+- **Dynamic model selection** (pretrained vs baseline)  
+- Upload `.tif` image (+ optional mask)  
+- Automatic preprocessing + feature engineering  
+- Predict segmentation mask  
+- Visualize:
+  - RGB composite  
+  - Predicted mask  
+  - Ground truth (if uploaded)  
 
+- Confidence scores:
+  - Overall probability  
+  - Water-only probability  
 
-Confidence Scores:
-Overall confidence (average probability across image).
-Predicted mask confidence (average probability on water pixels).
+- Metrics (if mask provided): IoU, F1  
 
+---
 
-Metrics (if ground truth uploaded): IoU and F1.
-Responsive UI with Bootstrap, custom CSS (gradient backgrounds, animations, hover effects).
+## 📊 Example Workflow
+1. Upload satellite `.tif` image  
+2. Preprocessing & feature extraction  
+3. Model predicts water regions  
+4. Outputs:
+   - Visualizations  
+   - Confidence scores  
+   - Metrics (if ground truth provided)  
 
+---
 
-📊 Example Workflow
+## 🔑 Key Files
+- **`best_pretrained_Raw.pth`** – UNet pretrained weights  
+- **`best_baseline_model.pth`** – TransUNet baseline weights  
+- **`pretrained_model_stats.json` / `baseline_model_stats.json`** – Metrics + normalization  
+- **`normalize_stats.json`** – Dataset-wide normalization stats  
+- **`app.py`** – Flask deployment app  
+- **`utils.py`** – Helper functions  
+- **`index.html` & `styles.css`** – UI + styling  
 
-Upload satellite .tif image (and optional mask).
-App preprocesses (bands selection/features + normalization).
-Model predicts water regions.
-Output: Visualization, confidences, and metrics (if mask provided).
+---
 
+## 📌 Future Work
+- Add REST API for batch predictions  
+- Improve mobile responsiveness  
+- Integrate live satellite API feeds  
+- Explore **ensemble methods** (pretrained + baseline)  
 
-🔑 Key Files
+---
 
-best_pretrained_Raw.pth – Weights for pretrained UNet model.  
-best_baseline_model.pth – Weights for baseline TransUNet model.  
-pretrained_model_stats.json / baseline_model_stats.json – Metrics (IoU/F1), normalization stats, band/feature indices.  
-normalize_stats.json – Additional normalization stats (from baseline).  
-app.py – Flask deployment app (handles uploads, predictions, rendering).  
-utils.py – Helper functions for reading images/masks and feature engineering.  
-index.html & styles.css – UI template and styles (Bootstrap + custom animations).
-
-
-📌 Future Work
-
-Add API endpoints for batch predictions.
-Optimize for mobile/responsive design.
-Integrate real-time satellite data feeds (e.g., via APIs).
-Explore ensemble models (combine pretrained + baseline).
-
-
-✨ Developed by Rowan YasserIf you use this repo, please ⭐ star it!
+✨ Developed by Rowan Yasser  
+If you use this repo, please ⭐ star it!  
