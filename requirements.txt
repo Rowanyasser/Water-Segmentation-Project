@@ -1,12 +1,16 @@
-torch>=2.0.0
-torchvision>=0.15.0
-numpy>=1.23.0
-pandas>=1.5.0
-tifffile>=2023.7.10
-Pillow>=9.5.0
-albumentations>=1.3.0
-scikit-image>=0.20.0
-scipy>=1.11.0
-matplotlib>=3.7.0
-tqdm>=4.65.0
-streamlit>=1.25.0
+flask==3.0.3
+torch==2.4.1
+torchvision==0.19.1  # For transforms if needed, though not directly used in app
+numpy==1.26.4
+matplotlib==3.9.2
+pillow==10.4.0  # For PIL.Image
+scikit-learn==1.5.2  # For metrics like jaccard_score, f1_score
+scipy==1.14.1  # For sobel, ndimage
+tifffile==2024.9.20  # For reading TIFF files
+segmentation-models-pytorch==0.3.4  # For smp.UNet
+albumentations==1.4.15  # Though not used in app, present in notebooks
+opencv-python==4.10.0.84  # For cv2 in notebooks (if needed)
+rasterio==1.3.11  # In notebooks for geospatial warnings
+pandas==2.2.3  # In notebooks
+seaborn==0.13.2  # In notebooks
+tqdm==4.66.5  # In notebooks
