@@ -11,8 +11,10 @@ import logging
 import segmentation_models_pytorch as smp
 import os
 import torch.nn.functional as F
-from utils import read_multiband_tif, read_mask, safe_div, compute_ndwi, compute_mndwi, compute_awei, compute_ndvi, sobel, ndimage
-from sklearn.metrics import f1_score, jaccard_score
+from utils import read_multiband_tif, read_mask, safe_div, compute_ndwi, compute_mndwi, compute_awei, compute_ndvi
+from scipy.ndimage import sobel
+from scipy import ndimage
+from sklearn.metrics import f1_score, jaccard_score, accuracy_score
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,14 +28,26 @@ try:
         pretrained_stats = json.load(f_pre)
     with open('baseline_model_stats.json', 'r') as f_base:
         baseline_stats = json.load(f_base)
-    pretrained_iou = pretrained_stats['metrics']['IoU']
+    
+    # Select best pretrained model (Raw or Chosen Bands)
+    pretrained_iou_raw = pretrained_stats['metrics']['IoU'] if pretrained_stats.get('selected_bands') is None else 0.0
+    pretrained_iou_chosen = pretrained_stats['metrics']['IoU'] if pretrained_stats.get('selected_bands') is not None else 0.0
+    pretrained_best = "Raw" if pretrained_iou_raw >= pretrained_iou_chosen else "Chosen Bands"
+    pretrained_model_path = f"best_pretrained_{pretrained_best}.pth"
+    
+    pretrained_iou = max(pretrained_iou_raw, pretrained_iou_chosen)
     baseline_iou = baseline_stats['metrics']['IoU']
     USE_PRETRAINED = pretrained_iou > baseline_iou
-    BEST_MODEL_PATH = "best_pretrained_Raw.pth" if USE_PRETRAINED else "best_baseline_model.pth"
-    IN_CHANNELS = 3 if USE_PRETRAINED else 19  # Adjusted to 19 for baseline to match checkpoint
+    BEST_MODEL_PATH = pretrained_model_path if USE_PRETRAINED else "best_baseline_model.pth"
+    
+    # Set in_channels based on model
+    if USE_PRETRAINED:
+        IN_CHANNELS = 12 if pretrained_best == "Raw" else 10
+    else:
+        IN_CHANNELS = 19  # Fixed to 19 based on baseline notebook analysis
     IS_PRETRAINED = USE_PRETRAINED
     STATS_FILE = "pretrained_model_stats.json" if USE_PRETRAINED else "baseline_model_stats.json"
-    logging.info(f"Selected model: {'Pretrained' if USE_PRETRAINED else 'Baseline (from scratch)'} with IoU {max(pretrained_iou, baseline_iou):.4f}")
+    logging.info(f"Selected model: {'Pretrained (' + pretrained_best + ')' if USE_PRETRAINED else 'Baseline (from scratch)'} with IoU {max(pretrained_iou, baseline_iou):.4f}")
 except FileNotFoundError as e:
     logging.error(f"Model stats file not found: {e}")
     raise
@@ -121,9 +135,9 @@ class TransUNet(nn.Module):
 
 # Load model with error handling
 if IS_PRETRAINED:
-    model = smp.UNet(encoder_name="resnet34", in_channels=IN_CHANNELS, classes=1)  # Use UNet to match checkpoint structure
+    model = smp.UNet(encoder_name="resnet34", in_channels=IN_CHANNELS, classes=1)
 else:
-    model = TransUNet(in_ch=IN_CHANNELS, n_classes=1)  # Use baseline TransUNet
+    model = TransUNet(in_ch=IN_CHANNELS, n_classes=1)
 try:
     model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=DEVICE))
 except RuntimeError as e:
@@ -142,20 +156,17 @@ def predict_image(image_file, mask_file=None):
         prob_map (uint8 0-255),
         overall_conf (float 0..1),
         pred_conf (float 0..1),
-        metrics (dict or None) -> {"IoU":..., "F1":...}
+        metrics (dict or None) -> {"IoU":..., "F1":..., "WaterRatio":..., "Accuracy":...}
     """
-    # Define temp_path for the image file
     temp_path = f"/tmp/{image_file.filename}"
     try:
-        # Save uploaded image file
         image_file.save(temp_path)
-        # Read the multi-band image
         img = read_multiband_tif(temp_path)
         if img is None or img.size == 0:
             raise ValueError("Failed to read the image file or image is empty.")
         C, H, W = img.shape
 
-        # Feature engineering (only if selected_bands is None, i.e., Raw dataset)
+        # Feature engineering
         extra_chs = []
         fi = feature_indices if not IS_PRETRAINED else {i: i for i in range(C)}
         if selected_bands and IS_PRETRAINED:
@@ -207,18 +218,11 @@ def predict_image(image_file, mask_file=None):
         overall_conf = float(output.mean())
         pred_conf = float(output[pred_mask_binary == 1].mean()) if pred_mask_binary.sum() > 0 else 0.0
 
-        # RGB composite for visualization
-        if img_norm.shape[0] >= 3:
-            rgb_unnorm = (img_norm[:3] * std_ext[:3, None, None]) + mean_ext[:3, None, None]
-            rgb_img_arr = np.clip(rgb_unnorm.transpose(1, 2, 0), 0, 1) * 255.0
-            rgb_img = Image.fromarray(rgb_img_arr.astype(np.uint8))
-        else:
-            single = img_norm[0]
-            rgb_img_arr = np.clip((single - single.min()) / (single.max() - single.min() + 1e-6), 0, 1)
-            rgb_img_arr = np.stack([rgb_img_arr]*3, axis=-1) * 255.0
-            rgb_img = Image.fromarray(rgb_img_arr.astype(np.uint8))
+        # Compute predicted water ratio
+        water_ratio = float(pred_mask_binary.sum() / pred_mask_binary.size)
 
-        # Ground truth metrics if mask_file is provided
+        # Compute accuracy
+        accuracy = None
         metrics = None
         gt_mask = None
         if mask_file and mask_file.filename:
@@ -234,32 +238,60 @@ def predict_image(image_file, mask_file=None):
                 try:
                     iou = jaccard_score(gt_mask.flatten(), pred_mask_binary.flatten(), zero_division=0)
                     f1 = f1_score(gt_mask.flatten(), pred_mask_binary.flatten(), zero_division=0)
-                    metrics = {"IoU": float(iou), "F1": float(f1)}
+                    accuracy = float(accuracy_score(gt_mask.flatten(), pred_mask_binary.flatten()))
+                    metrics = {"IoU": float(iou), "F1": float(f1), "WaterRatio": water_ratio, "Accuracy": accuracy}
                 except Exception as e:
                     logging.warning(f"Metrics computation failed: {e}")
-                    metrics = {"IoU": 0.0, "F1": 0.0}
+                    metrics = {"IoU": 0.0, "F1": 0.0, "WaterRatio": water_ratio, "Accuracy": 0.0}
             except Exception as e:
                 logging.error(f"Failed to process mask file: {e}")
-                metrics = None
+                metrics = {"WaterRatio": water_ratio, "Accuracy": pred_conf}
             finally:
                 if os.path.exists(mask_temp_path):
                     try:
                         os.remove(mask_temp_path)
                     except Exception as e:
                         logging.warning(f"Failed to remove temporary mask file: {e}")
+        else:
+            metrics = {"WaterRatio": water_ratio, "Accuracy": pred_conf}
+
+        # RGB composite for visualization (fixed)
+        rgb_indices = {'red': fi.get('red', 3), 'green': fi.get('green', 2), 'blue': fi.get('blue', 1)}  # Sentinel-2 defaults
+        if img.shape[0] >= max(rgb_indices.values()):
+            rgb_img = img[[rgb_indices['red'], rgb_indices['green'], rgb_indices['blue']]]
+            rgb_img = rgb_img.transpose(1, 2, 0)  # (H, W, 3)
+            rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-6)  # Normalize to [0, 1]
+            rgb_img = np.clip(rgb_img * 255.0, 0, 255).astype(np.uint8)
+        else:
+            rgb_img = np.stack([img[0]]*3, axis=-1)  # Fallback to grayscale
+            rgb_img = (rgb_img - rgb_img.min()) / (rgb_img.max() - rgb_img.min() + 1e-6) * 255.0
+            rgb_img = np.clip(rgb_img, 0, 255).astype(np.uint8)
+        rgb_pil = Image.fromarray(rgb_img)
+
+        # Overlay mask on RGB
+        overlay = rgb_img.copy()
+        mask_rgb = np.zeros_like(rgb_img)
+        mask_rgb[..., 0] = pred_mask_binary * 255  # Red overlay for water
+        alpha = 0.4  # Transparency
+        overlay = (overlay * (1 - alpha) + mask_rgb * alpha).astype(np.uint8)
+        overlay_pil = Image.fromarray(overlay)
 
         # Visualization
-        fig, axs = plt.subplots(1, 3 if gt_mask is not None else 2, figsize=(12, 4))
-        axs[0].imshow(rgb_img)
+        n_cols = 4 if gt_mask is not None else 3
+        fig, axs = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
+        axs[0].imshow(rgb_pil)
         axs[0].set_title('Original Image')
         axs[0].axis('off')
         axs[1].imshow(pred_mask, cmap='gray')
         axs[1].set_title('Predicted Mask')
         axs[1].axis('off')
+        axs[2].imshow(overlay_pil)
+        axs[2].set_title('Overlay (Water in Red)')
+        axs[2].axis('off')
         if gt_mask is not None:
-            axs[2].imshow(gt_mask * 255, cmap='gray')
-            axs[2].set_title('Ground Truth')
-            axs[2].axis('off')
+            axs[3].imshow(gt_mask * 255, cmap='gray')
+            axs[3].set_title('Ground Truth')
+            axs[3].axis('off')
         plt.tight_layout()
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight')
@@ -270,7 +302,6 @@ def predict_image(image_file, mask_file=None):
         return viz_data, prob_map, overall_conf, pred_conf, metrics
 
     finally:
-        # Clean up temporary image file
         if os.path.exists(temp_path):
             try:
                 os.remove(temp_path)

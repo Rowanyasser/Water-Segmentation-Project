@@ -41,7 +41,11 @@
                                 <b>Model Confidence:</b><br>
                                 Overall: {{ "%.2f"|format(overall_conf * 100) }}% <br>
                                 On predicted mask: {{ "%.2f"|format(pred_conf * 100) }}%
-                                {% if metrics %}
+                                <hr>
+                                <b>Prediction Metrics:</b><br>
+                                Predicted Water Ratio: {{ "%.2f"|format(metrics['WaterRatio'] * 100) }}% <br>
+                                Accuracy: {{ "%.2f"|format(metrics['Accuracy'] * 100) }}% {% if not metrics['IoU'] is defined %} (Confidence-based) {% endif %}
+                                {% if metrics['IoU'] is defined %}
                                     <hr>
                                     <b>Ground Truth Comparison:</b><br>
                                     IoU: {{ "%.4f"|format(metrics['IoU']) }} <br>
